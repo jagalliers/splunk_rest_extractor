@@ -408,7 +408,9 @@ class SplunkClient:
     @staticmethod
     def _iter_ndjson(r: httpx.Response) -> Iterator[tuple[dict[str, Any], int]]:
         buf = b""
-        for chunk in r.iter_raw():
+        # iter_bytes applies the Content-Encoding (Splunk gzips the export stream when the client advertises
+        # Accept-Encoding, which httpx does by default); iter_raw would hand back the compressed bytes.
+        for chunk in r.iter_bytes():
             buf += chunk
             while True:
                 nl = buf.find(b"\n")

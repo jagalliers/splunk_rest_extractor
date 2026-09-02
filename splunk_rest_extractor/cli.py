@@ -265,7 +265,11 @@ def cmd_run(a: argparse.Namespace) -> int:
         return 130
     counts = state.counts()
     ok = not any(counts.get(s) for s in ("pending", "running", "failed", "mismatch"))
-    report = validate(client, state, out, a.validate, sample=a.sample)
+    try:
+        report = validate(client, state, out, a.validate, sample=a.sample)
+    except BaseException:
+        state.finish_run("failed")  # never leave the manifest saying 'running' with no process behind it
+        raise
     state.finish_run("done" if ok and report["ok"] else "failed")
     log.info("run %s finished: %s; validation(%s) %s; report at %s", run["id"], counts, a.validate,
              "OK" if report["ok"] else "FAILED", out / "report.md")
@@ -371,7 +375,39 @@ def cmd_compact(a: argparse.Namespace) -> int:
     return 0
 
 
+TIME_OPTS = ("--earliest", "--latest")
+
+
+def join_time_values(argv: list[str]) -> list[str]:
+    """Turn `--earliest -1d@d` into `--earliest=-1d@d`.
+
+    argparse before Python 3.14 treats a value that starts with '-' as an unknown option and fails with
+    "expected one argument", so Splunk relative times could only be passed in the `--opt=value` form.
+    """
+    out: list[str] = []
+    it = iter(argv)
+    for tok in it:
+        if tok in TIME_OPTS:
+            nxt = next(it, None)
+            if nxt is None:
+                out.append(tok)
+                break
+            out.append(f"{tok}={nxt}")
+        else:
+            out.append(tok)
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = join_time_values(sys.argv[1:] if argv is None else list(argv))
+    # Event lines and the report carry arbitrary Unicode. On Windows a redirected stdout/stderr defaults to the
+    # legacy code page (cp1252) and `head`/`validate` would die with UnicodeEncodeError; make them UTF-8 everywhere,
+    # matching the files the tool writes.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # not a TextIOWrapper (e.g. replaced by a test harness)
+            pass
     p = argparse.ArgumentParser(prog="splunk-extract", description=__doc__)
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -400,6 +436,9 @@ def main(argv: list[str] | None = None) -> int:
         return a.fn(a)
     except SplunkError as e:
         log.error("%s", e)
+        return 1
+    except Exception:  # noqa: BLE001 - record the traceback in run.log, not just on the terminal
+        log.exception("unexpected error")
         return 1
 
 

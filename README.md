@@ -12,7 +12,7 @@ in [DESIGN.md](DESIGN.md).
 # 1. uv (Python project manager; installs Python 3.13 for you if needed)
 brew install uv
 
-# 2. get the code and its one dependency
+# 2. get the code and its dependencies (uv installs a Python 3.11+ for you if needed)
 git clone https://github.com/jagalliers/splunk_rest_extractor.git
 cd splunk_rest_extractor
 uv sync
@@ -48,39 +48,66 @@ curl -sk -u admin https://127.0.0.1:8089/services/authorization/tokens \
 
 ## Quick start (Windows, PowerShell)
 
-Not yet exercised by us on Windows: the code avoids POSIX-only calls (file locking,
-directory fsync) and writes all text as UTF-8, but please report anything odd.
+Exercised end to end on Windows 11 (ARM64, Windows PowerShell 5.1, uv-managed
+Python 3.14) against a Splunk Enterprise 9.4.8 lab instance: `plan`, `run` in job
+and export mode, `validate --level full --sample`, `compact`, `head`, and the full
+integration suite. Overflow bisection down to the export fallback, resume after
+Ctrl-C and after a hard kill, and the per-directory run lock were exercised on
+Windows against a REST simulator of the same endpoints.
 
 ```powershell
-# 1. prerequisites: Git and uv (then close and reopen PowerShell so PATH is refreshed)
-winget install --id Git.Git -e
-winget install --id astral-sh.uv -e
+# 1. prerequisites: Git and uv. `--source winget` skips the Microsoft Store source and its
+#    terms prompt; uv also pulls in the VC++ runtime it needs. Then close and reopen
+#    PowerShell: uv.exe lands in %LOCALAPPDATA%\Microsoft\WinGet\Links, which is only on
+#    the PATH of new shells.
+winget install --id Git.Git -e --source winget
+winget install --id astral-sh.uv -e --source winget
 
-# 2. get the code and its one dependency (uv installs Python 3.13 itself if needed)
+# 2. get the code and its dependencies. On a private repo Git Credential Manager opens a
+#    browser sign-in. uv downloads a Python if none is installed (the newest 3.x; on an
+#    ARM64 machine it is the x86-64 build, which runs fine under emulation).
 git clone https://github.com/jagalliers/splunk_rest_extractor.git
 cd splunk_rest_extractor
 uv sync
 
 # 3. credentials: copy the template, fill in SPLUNK_URL plus a token or user/password,
-#    then load it into this PowerShell session
+#    then load it into this PowerShell session (blank values are treated as unset)
 Copy-Item .env.example .env
 notepad .env
 Get-Content .env | ForEach-Object {
   if ($_ -match '^\s*([^#][^=]*)=(.*)$') { Set-Item -Path "Env:$($matches[1].Trim())" -Value $matches[2].Trim() }
 }
 
-# 4. sanity check: how would a range be chunked?  (quote the relative times: '@' is special in PowerShell)
+# 4. sanity check: how would a range be chunked?  Quote the relative times: an unquoted
+#    '@d' is splatting syntax to PowerShell and the argument silently disappears.
 uv run splunk-extract plan --insecure --spl 'index=_internal' --earliest '-1d@d' --latest '@d'
 
 # 5. extract it
 uv run splunk-extract run --insecure --spl 'index=_internal' --earliest '-1d@d' --latest '@d' `
     --out runs\internal-yesterday --validate total
 
-# 6. look at the result
+# 6. look at the result. Windows PowerShell 5.1 reads files as ANSI unless told otherwise,
+#    so ask for UTF-8 or the report's dashes and check marks come out as mojibake.
 uv run splunk-extract status --out runs\internal-yesterday
-Get-Content runs\internal-yesterday\report.md
+Get-Content runs\internal-yesterday\report.md -Encoding UTF8
 uv run splunk-extract head --out runs\internal-yesterday -n 3
 ```
+
+Windows notes:
+
+* Progress and log lines go to stderr and to `run.log` in the output directory.
+  Windows PowerShell 5.1 renders redirected stderr (`2>&1`) as red
+  `NativeCommandError` records; that is PowerShell, not a failure. Read `run.log`.
+* `head` output and the printed report are UTF-8 even when redirected to a file or
+  piped, whatever the console code page. Read them back with
+  `Get-Content -Encoding UTF8`.
+* Non-UTC `--tz` values need the `tzdata` package (Windows has no system zoneinfo
+  database); the project depends on it on Windows, so `uv sync` brings it in.
+* Stop a run with Ctrl-C and re-run the same command to resume. A run killed
+  outright (closed window, `taskkill`) resumes the same way: interrupted chunks are
+  re-queued and leftover `.part` files are removed.
+* One run per output directory: a second `run` on the same `--out` exits with
+  "another splunk-extract run is active".
 
 To mint a bearer token from PowerShell (use `curl.exe`; plain `curl` is an alias
 for `Invoke-WebRequest` in Windows PowerShell 5):
@@ -90,8 +117,6 @@ $exp = (Get-Date).AddDays(30).ToString('yyyy-MM-ddTHH:mm:sszz') + '00'
 curl.exe -sk -u admin https://127.0.0.1:8089/services/authorization/tokens `
   -d name=admin -d audience=splunk_rest_extractor -d "expires_on=$exp" -d output_mode=json
 ```
-
-Stop a run with Ctrl-C; re-run the same command to resume.
 
 ## Install (any platform)
 
