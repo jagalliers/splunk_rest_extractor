@@ -39,6 +39,7 @@ class RunConfig:
     fields: list[str] | None = None
     fmt: str = "ndjson"
     max_attempts: int = 3
+    retry_delay: int = 10          # seconds x attempt number before a failed chunk is retried
     oldest_first: bool = True
     on_bad_utf8: str = "replace"   # replace | fail
     time_format: str = "%Y-%m-%dT%H:%M:%S.%3N%:z"  # applied to _time on both endpoints so outputs are comparable
@@ -166,7 +167,7 @@ class Executor:
             self.state.log(chunk.id, "interrupted", "")
             return
         if fresh.attempts < self.cfg.max_attempts:
-            delay = 10 * fresh.attempts
+            delay = self.cfg.retry_delay * fresh.attempts
             log.warning("chunk %d failed (attempt %d): %s; retrying in %ds", chunk.id, fresh.attempts, error, delay)
             self.state.update_chunk(chunk.id, status="pending", error=error, sid=None, pages_done=0,
                                     not_before=time.time() + delay)

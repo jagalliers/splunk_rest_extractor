@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 EPOCH_RE = re.compile(r"^\d+(\.\d+)?$")
@@ -18,7 +18,7 @@ def resolve_time(value: str, resolver, *, round_up: bool) -> int:
         try:
             dt = datetime.fromisoformat(v)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.replace(tzinfo=UTC)
             f = dt.timestamp()
         except ValueError:
             f = float(resolver(v))
@@ -26,7 +26,7 @@ def resolve_time(value: str, resolver, *, round_up: bool) -> int:
 
 
 def get_tz(name: str):
-    return timezone.utc if name.upper() == "UTC" else ZoneInfo(name)
+    return UTC if name.upper() == "UTC" else ZoneInfo(name)
 
 
 def day_of(epoch: int, tz) -> str:

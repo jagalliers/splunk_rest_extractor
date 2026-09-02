@@ -346,6 +346,10 @@ Things learned while building that were not in the original design:
   small enough.
 * SIGINT is ignored for background jobs in non-interactive shells; the CLI handles
   SIGTERM identically (finish the current page, requeue, exit 130).
+* Whether the export stream arrives gzip-encoded depends on the server, not the
+  client: this instance never sets `Content-Encoding` even when the client
+  advertises gzip, while another 9.4.8 instance did. The export reader therefore
+  goes through httpx's decoding layer (`iter_bytes`), which handles both.
 
 Independent review pass (2026-09-02, second agent + own read-through) found and fixed:
 
@@ -388,5 +392,5 @@ Known limitations / next steps:
 * `index_latest` on generating commands (`| tstats`) is not covered by the
   integration tests.
 * No throttling based on live server load beyond back-off on 429/503.
-* Windows: portable code paths (msvcrt lock, no directory fsync, explicit UTF-8) but
-  not yet run on Windows.
+* Windows: verified on Windows 11 ARM64 against Splunk 9.4.8 (28 unit, 12 integration
+  tests). Needs `tzdata` there (no system zoneinfo) and UTF-8 stdout reconfiguration.

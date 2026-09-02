@@ -1,4 +1,4 @@
-from datetime import timezone
+from datetime import UTC
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -16,7 +16,7 @@ def test_resolve_epoch_iso_relative():
 
 def test_day_bounds_utc_tiles_range():
     start, end = 1534737600, 1534824000  # 04:00 UTC 2018-08-20 -> 04:00 UTC 2018-08-21
-    days = day_bounds(start, end, timezone.utc)
+    days = day_bounds(start, end, UTC)
     assert days == [("2018-08-20", 1534737600, 1534809600), ("2018-08-21", 1534809600, 1534824000)]
     assert days[0][1] == start and days[-1][2] == end
     assert all(a[2] == b[1] for a, b in zip(days, days[1:]))

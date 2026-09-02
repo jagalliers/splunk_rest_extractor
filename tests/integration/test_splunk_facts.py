@@ -4,8 +4,6 @@ Uses index=botsv3 (static) and index=_internal (live). Run: uv run pytest tests/
 """
 import time
 
-import pytest
-
 
 def count(client, spl, a, b, **kw):
     rows, st = client.run_scalar_search(f"{spl} | stats count", a, b, index_latest=None, search_level="fast", page_size=50000, **kw)

@@ -5,8 +5,9 @@ import gzip
 import hashlib
 import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 def chunk_path(data_dir: Path, day: str, start: int, end: int, fmt: str) -> Path:

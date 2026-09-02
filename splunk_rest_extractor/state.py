@@ -5,9 +5,10 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS run (
@@ -61,7 +62,7 @@ class Chunk:
     path: str | None
 
     @classmethod
-    def from_row(cls, r: sqlite3.Row) -> "Chunk":
+    def from_row(cls, r: sqlite3.Row) -> Chunk:
         return cls(
             id=r["id"], day=r["day"], start=r["start"], end=r["end"], mode=r["mode"], status=r["status"],
             expected=r["expected"], hot=bool(r["hot"]), parent=r["parent"], sid=r["sid"],

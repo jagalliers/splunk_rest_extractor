@@ -1,10 +1,10 @@
-from datetime import timezone
+from datetime import UTC
 
 from splunk_rest_extractor.planner import Bin, Planner, next_span
 
 
 def mk(target=100, min_span=1):
-    return Planner(client=None, spl="search x", pin=None, target=target, min_span=min_span, tz=timezone.utc,
+    return Planner(client=None, spl="search x", pin=None, target=target, min_span=min_span, tz=UTC,
                    search_level="fast", page_size=50000)
 
 

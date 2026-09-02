@@ -11,9 +11,10 @@ import logging
 import random
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterator
+from typing import Any
 
 import httpx
 

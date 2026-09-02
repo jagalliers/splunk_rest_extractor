@@ -107,9 +107,9 @@ def acquire_lock(path: Path):
             import fcntl
 
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as e:
         fh.close()
-        raise SystemExit(f"another splunk-extract run is active in {path.parent}")
+        raise SystemExit(f"another splunk-extract run is active in {path.parent}") from e
     return fh
 
 
@@ -413,18 +413,35 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("plan", help="dry run: show the chunk plan")
-    add_conn_args(sp); add_search_args(sp); sp.set_defaults(fn=cmd_plan)
+    add_conn_args(sp)
+    add_search_args(sp)
+    sp.set_defaults(fn=cmd_plan)
+
     sp = sub.add_parser("run", help="plan, extract, validate (re-run to resume)")
-    add_conn_args(sp); add_run_args(sp); sp.set_defaults(fn=cmd_run)
+    add_conn_args(sp)
+    add_run_args(sp)
+    sp.set_defaults(fn=cmd_run)
+
     sp = sub.add_parser("validate", help="validate an existing run")
-    add_conn_args(sp); sp.add_argument("--out", required=True); sp.add_argument("--level", default="full", choices=LEVELS)
-    sp.add_argument("--sample", type=int, default=0); sp.set_defaults(fn=cmd_validate)
+    add_conn_args(sp)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--level", default="full", choices=LEVELS)
+    sp.add_argument("--sample", type=int, default=0)
+    sp.set_defaults(fn=cmd_validate)
+
     sp = sub.add_parser("status", help="show run progress")
-    sp.add_argument("--out", required=True); sp.set_defaults(fn=cmd_status)
+    sp.add_argument("--out", required=True)
+    sp.set_defaults(fn=cmd_status)
+
     sp = sub.add_parser("head", help="print the first lines of a run's output")
-    sp.add_argument("--out", required=True); sp.add_argument("-n", type=int, default=5); sp.set_defaults(fn=cmd_head)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("-n", type=int, default=5)
+    sp.set_defaults(fn=cmd_head)
+
     sp = sub.add_parser("compact", help="concatenate each day's chunk files into one file per day")
-    sp.add_argument("--out", required=True); sp.add_argument("--delete-parts", action="store_true"); sp.set_defaults(fn=cmd_compact)
+    sp.add_argument("--out", required=True)
+    sp.add_argument("--delete-parts", action="store_true")
+    sp.set_defaults(fn=cmd_compact)
 
     a = p.parse_args(argv)
 

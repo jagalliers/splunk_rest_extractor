@@ -1,6 +1,4 @@
 import gzip
-import os
-from pathlib import Path
 
 from splunk_rest_extractor.state import State
 from splunk_rest_extractor.validate import coverage_gaps
