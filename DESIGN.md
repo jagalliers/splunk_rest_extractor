@@ -388,3 +388,5 @@ Known limitations / next steps:
 * `index_latest` on generating commands (`| tstats`) is not covered by the
   integration tests.
 * No throttling based on live server load beyond back-off on 429/503.
+* Windows: portable code paths (msvcrt lock, no directory fsync, explicit UTF-8) but
+  not yet run on Windows.

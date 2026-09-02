@@ -1,9 +1,8 @@
-"""splunk-extract: plan | run | validate | status | compact"""
+"""splunk-extract: plan | run | validate | status | head | compact"""
 from __future__ import annotations
 
 import argparse
 import dataclasses
-import fcntl
 import gzip
 import hashlib
 import logging
@@ -96,12 +95,30 @@ def add_run_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--sample", type=int, default=0, help="chunks to re-extract and compare at level full")
 
 
+def acquire_lock(path: Path):
+    """Exclusive, non-blocking lock on a file; portable across POSIX and Windows."""
+    fh = open(path, "w")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise SystemExit(f"another splunk-extract run is active in {path.parent}")
+    return fh
+
+
 def setup_logging(out: Path | None, verbose: bool) -> None:
     fmt = "%(asctime)s %(levelname)-7s %(threadName)-4s %(message)s"
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(out / "run.log"))
+        handlers.append(logging.FileHandler(out / "run.log", encoding="utf-8"))
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format=fmt, handlers=handlers)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -109,7 +126,7 @@ def setup_logging(out: Path | None, verbose: bool) -> None:
 
 def load_spl(a: argparse.Namespace) -> str:
     if a.spl_file:
-        raw = Path(a.spl_file).read_text()
+        raw = Path(a.spl_file).read_text(encoding="utf-8")
     elif a.spl:
         raw = a.spl
     else:
@@ -202,11 +219,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     if quotas["srchJobsQuota"] and cfg.workers + 1 > quotas["srchJobsQuota"]:
         log.warning("--workers %d exceeds srchJobsQuota %d", cfg.workers, quotas["srchJobsQuota"])
 
-    lock = open(out / ".lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        raise SystemExit(f"another splunk-extract run is active in {out}")
+    lock = acquire_lock(out / ".lock")  # noqa: F841 - held for the life of the process
     state = State(out / "manifest.sqlite")
     run = state.get_run()
     if run is None:
@@ -267,7 +280,7 @@ def cmd_validate(a: argparse.Namespace) -> int:
         raise SystemExit(f"no run in {out}")
     client = make_client(a) if a.level in ("total", "full") else None
     report = validate(client, state, out, a.level, sample=a.sample)
-    print((out / "report.md").read_text())
+    print((out / "report.md").read_text(encoding="utf-8"))
     return 0 if report["ok"] else 1
 
 
@@ -285,6 +298,27 @@ def cmd_status(a: argparse.Namespace) -> int:
     for c in state.chunks():
         if c.status in ("failed", "mismatch", "running", "pending"):
             print(f"  #{c.id} {c.day} [{c.start},{c.end}) {c.status} mode={c.mode} attempts={c.attempts} expected={c.expected} written={c.written} err={c.error}")
+    return 0
+
+
+def cmd_head(a: argparse.Namespace) -> int:
+    """Print the first N lines of the run's output without needing gzcat/zcat."""
+    out = Path(a.out)
+    state = State(out / "manifest.sqlite")
+    if state.get_run() is None:
+        raise SystemExit(f"no run in {out}")
+    seen: set[str] = set()
+    remaining = a.n
+    for c in state.chunks("done"):
+        if not c.path or c.path in seen or remaining <= 0:
+            continue
+        seen.add(c.path)
+        with gzip.open(c.path, "rt", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if remaining <= 0:
+                    break
+                sys.stdout.write(line)
+                remaining -= 1
     return 0
 
 
@@ -351,6 +385,8 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--sample", type=int, default=0); sp.set_defaults(fn=cmd_validate)
     sp = sub.add_parser("status", help="show run progress")
     sp.add_argument("--out", required=True); sp.set_defaults(fn=cmd_status)
+    sp = sub.add_parser("head", help="print the first lines of a run's output")
+    sp.add_argument("--out", required=True); sp.add_argument("-n", type=int, default=5); sp.set_defaults(fn=cmd_head)
     sp = sub.add_parser("compact", help="concatenate each day's chunk files into one file per day")
     sp.add_argument("--out", required=True); sp.add_argument("--delete-parts", action="store_true"); sp.set_defaults(fn=cmd_compact)
 

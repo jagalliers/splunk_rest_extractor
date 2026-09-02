@@ -32,7 +32,7 @@ uv run splunk-extract run --insecure --spl 'index=_internal' --earliest -1d@d --
 # 6. look at the result
 uv run splunk-extract status --out runs/internal-yesterday
 cat runs/internal-yesterday/report.md
-gzcat runs/internal-yesterday/data/*/*.jsonl.gz | head -3
+uv run splunk-extract head --out runs/internal-yesterday -n 3
 ```
 
 `--insecure` skips TLS verification for a self-signed lab certificate. Drop it and
@@ -45,6 +45,53 @@ curl -sk -u admin https://127.0.0.1:8089/services/authorization/tokens \
   -d name=admin -d audience=splunk_rest_extractor \
   -d expires_on="$(date -v+30d +%Y-%m-%dT%H:%M:%S%z)" -d output_mode=json | python3 -m json.tool
 ```
+
+## Quick start (Windows, PowerShell)
+
+Not yet exercised by us on Windows: the code avoids POSIX-only calls (file locking,
+directory fsync) and writes all text as UTF-8, but please report anything odd.
+
+```powershell
+# 1. prerequisites: Git and uv (then close and reopen PowerShell so PATH is refreshed)
+winget install --id Git.Git -e
+winget install --id astral-sh.uv -e
+
+# 2. get the code and its one dependency (uv installs Python 3.13 itself if needed)
+git clone https://github.com/jagalliers/splunk_rest_extractor.git
+cd splunk_rest_extractor
+uv sync
+
+# 3. credentials: copy the template, fill in SPLUNK_URL plus a token or user/password,
+#    then load it into this PowerShell session
+Copy-Item .env.example .env
+notepad .env
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^\s*([^#][^=]*)=(.*)$') { Set-Item -Path "Env:$($matches[1].Trim())" -Value $matches[2].Trim() }
+}
+
+# 4. sanity check: how would a range be chunked?  (quote the relative times: '@' is special in PowerShell)
+uv run splunk-extract plan --insecure --spl 'index=_internal' --earliest '-1d@d' --latest '@d'
+
+# 5. extract it
+uv run splunk-extract run --insecure --spl 'index=_internal' --earliest '-1d@d' --latest '@d' `
+    --out runs\internal-yesterday --validate total
+
+# 6. look at the result
+uv run splunk-extract status --out runs\internal-yesterday
+Get-Content runs\internal-yesterday\report.md
+uv run splunk-extract head --out runs\internal-yesterday -n 3
+```
+
+To mint a bearer token from PowerShell (use `curl.exe`; plain `curl` is an alias
+for `Invoke-WebRequest` in Windows PowerShell 5):
+
+```powershell
+$exp = (Get-Date).AddDays(30).ToString('yyyy-MM-ddTHH:mm:sszz') + '00'
+curl.exe -sk -u admin https://127.0.0.1:8089/services/authorization/tokens `
+  -d name=admin -d audience=splunk_rest_extractor -d "expires_on=$exp" -d output_mode=json
+```
+
+Stop a run with Ctrl-C; re-run the same command to resume.
 
 ## Install (any platform)
 
@@ -68,6 +115,7 @@ splunk-extract run --spl 'index=web sourcetype=access_combined' \
 
 # progress / problems
 splunk-extract status --out runs/web-aug
+splunk-extract head --out runs/web-aug -n 5
 
 # deeper validation any time later (re-reads files, recounts every chunk, re-extracts a sample)
 splunk-extract validate --out runs/web-aug --level full --sample 5

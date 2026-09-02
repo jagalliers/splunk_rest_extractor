@@ -55,11 +55,12 @@ class ChunkWriter:
         os.fsync(self._raw.fileno())
         self._raw.close()
         os.replace(self.part_path, self.final_path)
-        dfd = os.open(str(self.final_path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        if os.name != "nt":  # directory fsync so the rename itself is durable; Windows cannot open a directory
+            dfd = os.open(str(self.final_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         return {
             "written": self.written,
             "bytes": self._bytes,

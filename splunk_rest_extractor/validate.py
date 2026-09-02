@@ -177,8 +177,8 @@ def validate(client: SplunkClient | None, state: State, out_dir: Path, level: st
     if tmp.exists() and not any(tmp.iterdir()):
         tmp.rmdir()
     report["generated"] = time.time()
-    (out_dir / "report.json").write_text(json.dumps(report, indent=2, default=str))
-    (out_dir / "report.md").write_text(_markdown(report, run, state))
+    (out_dir / "report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    (out_dir / "report.md").write_text(_markdown(report, run, state), encoding="utf-8")
     return report
 
 
