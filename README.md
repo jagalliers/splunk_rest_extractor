@@ -25,7 +25,7 @@ git clone https://github.com/jagalliers/splunk_rest_extractor.git
 cd splunk_rest_extractor
 uv sync
 
-cp .env.example .env                  # PowerShell: copy .env.example .env
+cp .env.example .env
 # edit .env: SPLUNK_URL plus a token or username/password. The tool reads it from the current directory.
 
 # sanity check: how would the range be chunked?
@@ -37,8 +37,7 @@ uv run splunk-extract run --insecure --spl 'index=_internal' --earliest -24h --l
 # look at the result
 uv run splunk-extract status --out runs/last-day
 uv run splunk-extract head --out runs/last-day -n 3
-cat runs/last-day/report.md           # PowerShell: type runs\last-day\report.md
-eport.md
+cat runs/last-day/report.md
 ```
 
 `--insecure` skips TLS verification for a self-signed lab certificate. Drop it and
