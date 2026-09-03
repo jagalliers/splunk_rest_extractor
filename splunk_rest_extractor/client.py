@@ -24,7 +24,11 @@ JOBS = "/services/search/v2/jobs"
 
 
 class SplunkError(Exception):
-    """Non-retryable error from Splunk or the transport."""
+    """Non-retryable error from Splunk or the transport. ``status`` is the HTTP status when one applies."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class AuthError(SplunkError):
@@ -136,6 +140,7 @@ class SplunkClient:
         self._username = username
         self._password = password
         self._auth_header: str | None = f"Bearer {token}" if token else None
+        self._connected = False  # any response received; until then transport errors are not retried
         self._lock = threading.Lock()
         self.max_retries = max_retries
         self._http = httpx.Client(
@@ -155,8 +160,9 @@ class SplunkClient:
             "/services/auth/login",
             data={"username": self._username, "password": self._password, "output_mode": "json"},
         )
+        self._connected = True
         if r.status_code != 200:
-            raise AuthError(f"login failed: HTTP {r.status_code} {r.text[:300]}")
+            raise AuthError(f"login failed: HTTP {r.status_code} {r.text[:300]}", status=r.status_code)
         key = r.json().get("sessionKey")
         if not key:
             raise AuthError("login response carried no sessionKey")
@@ -183,11 +189,14 @@ class SplunkClient:
             try:
                 r = self._http.request(method, path, params=params, data=data, headers=self._headers())
             except httpx.TransportError as e:
+                if not self._connected:
+                    raise  # a wrong URL, port, hostname or certificate never fixes itself; do not stall on retries
                 attempt += 1
                 if attempt > self.max_retries:
                     raise RetryExhausted(f"{method} {path}: {e!r} after {attempt} attempts") from e
                 self._sleep(attempt, f"{method} {path}: transport error {e!r}")
                 continue
+            self._connected = True
 
             if r.status_code == 401 and self._password and not relogged:
                 log.warning("401 on %s %s; re-authenticating", method, path)
@@ -197,13 +206,13 @@ class SplunkClient:
             if r.status_code in (429, 502, 503, 504):
                 attempt += 1
                 if attempt > self.max_retries * 3:
-                    raise RetryExhausted(f"{method} {path}: HTTP {r.status_code} {r.text[:300]}")
+                    raise RetryExhausted(f"{method} {path}: HTTP {r.status_code} {r.text[:300]}", status=r.status_code)
                 self._sleep(attempt, f"{method} {path}: HTTP {r.status_code}", cap=60.0)
                 continue
             if r.status_code == 404 and "/jobs/" in path:
-                raise JobGone(f"{method} {path}: 404")
+                raise JobGone(f"{method} {path}: 404", status=404)
             if r.status_code >= 400:
-                raise SplunkError(f"{method} {path}: HTTP {r.status_code}: {r.text[:500]}")
+                raise SplunkError(f"{method} {path}: HTTP {r.status_code}: {r.text[:500]}", status=r.status_code)
             return r
 
     @staticmethod
@@ -396,13 +405,14 @@ class SplunkClient:
             data["output_time_format"] = time_format
         for attempt in range(2):
             with self._http.stream("POST", f"{JOBS}/export", data=data, headers=self._headers()) as r:
+                self._connected = True
                 if r.status_code == 401 and self._password and attempt == 0:
                     log.warning("401 on export; re-authenticating")
                     self.login()
                     continue
                 if r.status_code != 200:
                     body = r.read()
-                    raise SplunkError(f"export HTTP {r.status_code}: {decode_tolerant(body)[0][:500]}")
+                    raise SplunkError(f"export HTTP {r.status_code}: {decode_tolerant(body)[0][:500]}", status=r.status_code)
                 yield from self._iter_ndjson(r)
                 return
 

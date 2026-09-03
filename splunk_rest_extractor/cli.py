@@ -5,20 +5,23 @@ import argparse
 import dataclasses
 import gzip
 import hashlib
+import json
 import logging
 import os
 import shutil
 import signal
+import sqlite3
 import sys
 import time
 import uuid
 from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
 
 import httpx
 
 from . import envfile
 from . import spl as splmod
-from .client import SplunkClient, SplunkError
+from .client import AuthError, RetryExhausted, SplunkClient, SplunkError
 from .executor import Executor, RunConfig, config_dict
 from .planner import Planner
 from .state import State
@@ -26,6 +29,19 @@ from .timerange import get_tz, resolve_time
 from .validate import LEVELS, validate
 
 log = logging.getLogger("splunk_rest_extractor")
+
+EXIT_OK, EXIT_FAILURE, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 130
+SAME_OUT_HINT = "pass the same --out you gave to `run`"
+
+
+class CliError(Exception):
+    """An anticipated failure: reported as one ERROR line plus a hint, never a traceback."""
+
+    def __init__(self, message: str, *, hint: str | None = None, code: int = EXIT_FAILURE) -> None:
+        super().__init__(message)
+        self.hint = hint
+        self.code = code
+
 
 DEFAULT_FIELDS = "_time,_raw,index,sourcetype,source,host,_indextime,_bkt,_cd"
 
@@ -55,7 +71,9 @@ def resolve_connection(a: argparse.Namespace) -> None:
     if a.env_file:
         path = Path(a.env_file)
         if not path.is_file():
-            raise SystemExit(f"--env-file {path}: no such file")
+            raise CliError(f"--env-file {path}: no such file",
+                           hint="pass the path of a KEY=VALUE file, or omit --env-file to use .env in the current directory",
+                           code=EXIT_USAGE)
     else:
         path = Path(".env")
     loaded = envfile.load(path)
@@ -120,7 +138,11 @@ def add_run_args(p: argparse.ArgumentParser) -> None:
 
 def acquire_lock(path: Path):
     """Exclusive, non-blocking lock on a file; portable across POSIX and Windows."""
-    fh = open(path, "w")
+    try:
+        fh = open(path, "w")
+    except OSError as e:
+        raise CliError(f"cannot write to {path.parent}: {e.strerror}",
+                       hint="check that the --out directory is writable") from e
     try:
         if os.name == "nt":
             import msvcrt
@@ -132,43 +154,110 @@ def acquire_lock(path: Path):
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as e:
         fh.close()
-        raise SystemExit(f"another splunk-extract run is active in {path.parent}") from e
+        raise CliError(f"another splunk-extract run is active in {path.parent}",
+                       hint="wait for it to finish or stop it; to start a separate run use a different --out") from e
     return fh
 
 
-def setup_logging(out: Path | None, verbose: bool) -> None:
-    fmt = "%(asctime)s %(levelname)-7s %(threadName)-4s %(message)s"
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
-    if out is not None:
-        out.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(out / "run.log", encoding="utf-8"))
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format=fmt, handlers=handlers)
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(threadName)-4s %(message)s"
+_handlers: list[logging.Handler] = []  # what this process added to the root logger; removed by teardown_logging
+
+
+def setup_logging(verbose: bool) -> None:
+    """Log to stderr for the whole process. Called once by main() before any command runs, so every
+    message, including a failure while reading the SPL or opening the output directory, has the same format."""
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(logging.Formatter(LOG_FORMAT))
+    root.addHandler(h)
+    _handlers.append(h)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def attach_run_log(out: Path) -> None:
+    """Also write the log to run.log in the output directory (run and validate)."""
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        h = logging.FileHandler(out / "run.log", encoding="utf-8")
+    except OSError as e:
+        raise CliError(f"cannot create the output directory {out}: {e.strerror}",
+                       hint="check the --out path and that it is writable") from e
+    h.setFormatter(logging.Formatter(LOG_FORMAT))
+    logging.getLogger().addHandler(h)
+    _handlers.append(h)
+
+
+def teardown_logging() -> None:
+    root = logging.getLogger()
+    for h in _handlers:
+        root.removeHandler(h)
+        h.close()
+    _handlers.clear()
+
+
 def load_spl(a: argparse.Namespace) -> str:
     if a.spl_file:
-        raw = Path(a.spl_file).read_text(encoding="utf-8")
+        try:
+            raw = Path(a.spl_file).read_text(encoding="utf-8")
+        except OSError as e:
+            raise CliError(f"cannot read --spl-file {a.spl_file}: {e.strerror}",
+                           hint="check the path", code=EXIT_USAGE) from e
+        except UnicodeDecodeError as e:
+            raise CliError(f"--spl-file {a.spl_file} is not UTF-8 text",
+                           hint="save the file as UTF-8 without a byte-order mark", code=EXIT_USAGE) from e
     elif a.spl:
         raw = a.spl
     else:
-        raise SystemExit("one of --spl / --spl-file is required")
-    spl = splmod.normalize(raw)
+        raise CliError("one of --spl / --spl-file is required", code=EXIT_USAGE)
+    try:
+        spl = splmod.normalize(raw)
+    except ValueError as e:
+        raise CliError("the search is empty",
+                       hint="pass the SPL with --spl 'index=... ' or --spl-file path", code=EXIT_USAGE) from e
     issues = splmod.validate(spl)
     for i in issues:
         (log.error if i.level == "error" else log.warning)("SPL %s: %s", i.level, i.text)
-    if any(i.level == "error" for i in issues):
-        raise SystemExit(2)
+    errors = sum(i.level == "error" for i in issues)
+    if errors:
+        raise CliError(f"the search was rejected ({errors} SPL error(s) above)",
+                       hint="fix the search and re-run", code=EXIT_USAGE)
     return spl
 
 
+TIME_HINT = "accepted: Splunk relative time such as -7d@d or now, ISO-8601 such as 2026-08-01T00:00:00, or epoch seconds"
+
+
 def resolve_range(client: SplunkClient, a: argparse.Namespace) -> tuple[int, int]:
-    earliest = resolve_time(a.earliest, client.timeparser, round_up=False)
-    latest = resolve_time(a.latest, client.timeparser, round_up=True)
+    def resolve(flag: str, value: str, round_up: bool) -> int:
+        try:
+            return resolve_time(value, client.timeparser, round_up=round_up)
+        except SplunkError as e:
+            if e.status not in (None, 400):  # Splunk answers a bad expression with 400 "Invalid time."
+                raise
+            raise CliError(f"Splunk could not parse {flag} {value!r}", hint=TIME_HINT, code=EXIT_USAGE) from e
+
+    earliest = resolve("--earliest", a.earliest, False)
+    latest = resolve("--latest", a.latest, True)
     if latest <= earliest:
-        raise SystemExit(f"latest ({latest}) must be after earliest ({earliest})")
+        raise CliError(f"--latest ({a.latest!r} = {latest}) is not after --earliest ({a.earliest!r} = {earliest})",
+                       hint=TIME_HINT, code=EXIT_USAGE)
     return earliest, latest
+
+
+def open_run(out: Path) -> tuple[State, dict]:
+    """Open an existing run directory, or say precisely why it is not one (without creating anything)."""
+    if not out.is_dir():
+        raise CliError(f"no run directory at {out}", hint=SAME_OUT_HINT)
+    if not (out / "manifest.sqlite").is_file():
+        raise CliError(f"{out} is not a run directory (no manifest.sqlite)", hint=SAME_OUT_HINT)
+    state = State(out / "manifest.sqlite")
+    run = state.get_run()
+    if run is None:
+        raise CliError(f"no run in {out}: the manifest is empty",
+                       hint="the run never got past planning; re-run the `run` command with the same --out")
+    return state, run
 
 
 def build_planner(client: SplunkClient, spl: str, pin: int | None, a: argparse.Namespace, page_size: int) -> Planner:
@@ -186,7 +275,6 @@ def print_plan(chunks) -> None:
 
 # ------------------------------------------------------------------ commands
 def cmd_plan(a: argparse.Namespace) -> int:
-    setup_logging(None, a.verbose)
     spl = load_spl(a)
     client = make_client(a)
     earliest, latest = resolve_range(client, a)
@@ -201,7 +289,7 @@ def cmd_plan(a: argparse.Namespace) -> int:
 
 def cmd_run(a: argparse.Namespace) -> int:
     out = Path(a.out)
-    setup_logging(out, a.verbose)
+    attach_run_log(out)
     spl = load_spl(a)
     spl_sha = hashlib.sha256(spl.encode()).hexdigest()
     client = make_client(a)
@@ -265,7 +353,8 @@ def cmd_run(a: argparse.Namespace) -> int:
         run = state.get_run()
     else:
         if run["spl_sha"] != spl_sha:
-            raise SystemExit(f"{out} holds a run for a different SPL; use a new --out")
+            raise CliError(f"{out} already holds a run for a different SPL",
+                           hint="each run needs its own directory: pass a new --out, or re-run the original SPL to resume")
         earliest, latest = resolve_range(client, a)
         if (earliest, latest) != (run["earliest"], run["latest"]):
             log.warning("resuming with the manifest's range [%d,%d), ignoring --earliest/--latest", run["earliest"], run["latest"])
@@ -296,15 +385,20 @@ def cmd_run(a: argparse.Namespace) -> int:
     state.finish_run("done" if ok and report["ok"] else "failed")
     log.info("run %s finished: %s; validation(%s) %s; report at %s", run["id"], counts, a.validate,
              "OK" if report["ok"] else "FAILED", out / "report.md")
-    return 0 if (ok and report["ok"]) else 1
+    if not ok:
+        log.error("run %s failed: %d chunk(s) failed, %d mismatched, %d unfinished", run["id"],
+                  counts.get("failed", 0), counts.get("mismatch", 0), counts.get("pending", 0) + counts.get("running", 0))
+        log.error("   -> run `splunk-extract status --out %s` for the per-chunk reasons, then re-run the same command to retry", out)
+    elif not report["ok"]:  # every chunk done, yet the evidence disagrees: that is the real finding
+        log.error("validation (%s) FAILED: the extracted files do not match what Splunk reports", a.validate)
+        log.error("   -> see %s for the failing checks", out / "report.md")
+    return EXIT_OK if (ok and report["ok"]) else EXIT_FAILURE
 
 
 def cmd_validate(a: argparse.Namespace) -> int:
     out = Path(a.out)
-    setup_logging(out, a.verbose)
-    state = State(out / "manifest.sqlite")
-    if state.get_run() is None:
-        raise SystemExit(f"no run in {out}")
+    state, _ = open_run(out)
+    attach_run_log(out)
     client = make_client(a) if a.level in ("total", "full") else None
     report = validate(client, state, out, a.level, sample=a.sample)
     print((out / "report.md").read_text(encoding="utf-8"))
@@ -312,12 +406,8 @@ def cmd_validate(a: argparse.Namespace) -> int:
 
 
 def cmd_status(a: argparse.Namespace) -> int:
-    setup_logging(None, a.verbose)
     out = Path(a.out)
-    state = State(out / "manifest.sqlite")
-    run = state.get_run()
-    if run is None:
-        raise SystemExit(f"no run in {out}")
+    state, run = open_run(out)
     print(f"run {run['id']} status={run['status']} spl={run['spl']!r}")
     print(f"range [{run['earliest']},{run['latest']}) pin={run['pin']}")
     print("chunks:", state.counts())
@@ -331,9 +421,7 @@ def cmd_status(a: argparse.Namespace) -> int:
 def cmd_head(a: argparse.Namespace) -> int:
     """Print the first N lines of the run's output without needing gzcat/zcat."""
     out = Path(a.out)
-    state = State(out / "manifest.sqlite")
-    if state.get_run() is None:
-        raise SystemExit(f"no run in {out}")
+    state, _ = open_run(out)
     seen: set[str] = set()
     remaining = a.n
     for c in state.chunks("done"):
@@ -351,17 +439,14 @@ def cmd_head(a: argparse.Namespace) -> int:
 
 def cmd_compact(a: argparse.Namespace) -> int:
     """Concatenate each day's chunk files (gzip members) into one day file, driven by the manifest."""
-    setup_logging(None, a.verbose)
     out = Path(a.out)
     data = out / "data"
-    state = State(out / "manifest.sqlite")
-    run = state.get_run()
-    if run is None:
-        raise SystemExit(f"no run in {out}")
+    state, run = open_run(out)
     leaf = [c for c in state.chunks() if c.status != "split"]
     not_done = [c for c in leaf if c.status != "done"]
     if not_done:
-        raise SystemExit(f"refusing to compact: {len(not_done)} chunk(s) are not done (run `status`)")
+        raise CliError(f"refusing to compact: {len(not_done)} chunk(s) are not done",
+                       hint="re-run the original `run` command to finish them (see `status --out`), then compact")
     ext = ".jsonl.gz" if run["options"].get("fmt", "ndjson") == "ndjson" else ".raw.gz"
     by_day: dict[str, list] = {}
     for c in leaf:
@@ -384,7 +469,8 @@ def cmd_compact(a: argparse.Namespace) -> int:
         want = sum((c.written or 0) + ((c.multiline or 0) if ext == ".raw.gz" else 0) for c in group)
         if n != want:
             target.unlink()
-            raise SystemExit(f"{target}: {n} lines but manifest expects {want}; compaction aborted")
+            raise CliError(f"{target}: {n} lines but the manifest expects {want}; compaction aborted",
+                           hint="the per-chunk files are untouched; re-run compact, and report this if it repeats")
         old_paths = [Path(c.path) for c in group]
         for c in group:
             state.update_chunk(c.id, path=str(target))
@@ -419,6 +505,97 @@ def join_time_values(argv: list[str]) -> list[str]:
         else:
             out.append(tok)
     return out
+
+
+def _transport(e: BaseException, url: str) -> tuple[str, str]:
+    """(message, hint) for an httpx transport error, keyed on the signatures httpx actually produces."""
+    text = str(e)
+    if "CERTIFICATE_VERIFY_FAILED" in text:
+        return (f"the TLS certificate of {url} is not trusted",
+                "self-signed or private CA? pass --ca-bundle /path/to/ca.pem, or for a lab --insecure")
+    if "WRONG_VERSION_NUMBER" in text:
+        return (f"{url} is not speaking TLS",
+                "the management API is https on port 8089; the web UI on port 8000 is not it")
+    if "getaddrinfo" in text or "Name or service not known" in text or "nodename nor servname" in text:
+        return (f"cannot resolve the host name in {url}", "check the host in SPLUNK_URL / --url")
+    if isinstance(e, httpx.ConnectTimeout):
+        return (f"nothing answered at {url}",
+                "the port is closed or filtered (a closed port times out); is 8089 reachable from here, VPN up?")
+    if isinstance(e, httpx.ConnectError):
+        return (f"cannot connect to {url}: {text}",
+                "is SPLUNK_URL the management port (8089)? is the host reachable from here?")
+    if isinstance(e, (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+        return (f"Splunk at {url} stopped responding",
+                "raise --read-timeout for slow searches, or lower --chunk-target-events")
+    if isinstance(e, (httpx.UnsupportedProtocol, httpx.InvalidURL)):
+        return (f"invalid URL {url!r}", "expected form https://host:8089")
+    return (f"{url}: {text or type(e).__name__}",
+            "network problem between here and Splunk; re-run the same command to resume")
+
+
+@dataclasses.dataclass
+class Diagnosis:
+    message: str
+    hint: str | None
+    code: int
+    traceback: bool = False
+
+
+def explain(e: BaseException, a: argparse.Namespace) -> Diagnosis:
+    """Turn any exception escaping a command into what the user should read: what failed, and what to do."""
+    url = getattr(a, "url", None) or "Splunk"
+    if isinstance(e, CliError):
+        return Diagnosis(str(e), e.hint, e.code)
+    if isinstance(e, KeyboardInterrupt):
+        return Diagnosis("interrupted", "re-run the same command to resume" if getattr(a, "cmd", None) == "run" else None,
+                         EXIT_INTERRUPTED)
+    if isinstance(e, RetryExhausted):
+        if isinstance(e.__cause__, httpx.HTTPError):
+            msg, hint = _transport(e.__cause__, url)
+            return Diagnosis(f"gave up: {msg}", hint, EXIT_FAILURE)
+        return Diagnosis(f"gave up: {e}",
+                         "Splunk kept answering busy or unavailable (HTTP 429/502/503/504); wait, then re-run the same "
+                         "command to resume", EXIT_FAILURE)
+    if isinstance(e, SplunkError):
+        status = e.status
+        if isinstance(e, AuthError) and status is None:  # no credentials at all
+            return Diagnosis(str(e), "set SPLUNK_TOKEN, or SPLUNK_USERNAME and SPLUNK_PASSWORD, in .env or the environment "
+                             "(or pass --token / --username / --password)", EXIT_USAGE)
+        if status == 401:
+            if getattr(a, "token", None):
+                hint = ("the token was not accepted: it may be expired or revoked, pasted with a 'Bearer ' prefix or "
+                        "wrapped onto two lines, or token authentication may be disabled on the server (Settings > Tokens)")
+            else:
+                hint = "check SPLUNK_USERNAME / SPLUNK_PASSWORD (or --username / --password); the account may also be locked"
+            return Diagnosis(f"Splunk rejected the credentials (HTTP 401) on {url}", hint, EXIT_FAILURE)
+        if status == 403:
+            return Diagnosis(f"Splunk refused the request (HTTP 403): {e}",
+                             "the account lacks a capability (search, or rest_properties_get to read limits); ask a Splunk admin",
+                             EXIT_FAILURE)
+        if status is not None:
+            return Diagnosis(str(e), "the Splunk message above says what it objected to", EXIT_FAILURE)
+        return Diagnosis(str(e), None, EXIT_FAILURE)
+    if isinstance(e, httpx.HTTPError):
+        msg, hint = _transport(e, url)
+        return Diagnosis(msg, hint, EXIT_FAILURE)
+    if isinstance(e, json.JSONDecodeError):
+        return Diagnosis(f"{url} answered with something other than JSON",
+                         "SPLUNK_URL probably points at the web UI (port 8000) or a proxy login page; use the management "
+                         "port, https://host:8089", EXIT_FAILURE)
+    if isinstance(e, ZoneInfoNotFoundError):
+        return Diagnosis(f"unknown time zone {getattr(a, 'tz', '?')!r}",
+                         "use an IANA name such as America/Chicago, Europe/London, or UTC", EXIT_USAGE)
+    if isinstance(e, sqlite3.OperationalError):
+        return Diagnosis(f"cannot open the run manifest: {e}",
+                         "check that --out exists, is writable, and is not on a share that forbids file locking", EXIT_FAILURE)
+    if isinstance(e, OSError):
+        where = f" {e.filename}" if getattr(e, "filename", None) else ""
+        return Diagnosis(f"file error{where}: {e.strerror or e}",
+                         "check that the path exists and is writable, and that the disk is not full", EXIT_FAILURE)
+    out = getattr(a, "out", None)
+    where = f"; it is also recorded in {Path(out) / 'run.log'}" if out and len(_handlers) > 1 else ""
+    return Diagnosis(f"unexpected error (this is a bug): {type(e).__name__}: {e}",
+                     f"traceback follows{where}; please report it with the command line", EXIT_FAILURE, traceback=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -467,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.set_defaults(fn=cmd_compact)
 
     a = p.parse_args(argv)
+    setup_logging(a.verbose)
 
     def _term(signum, frame):  # SIGTERM from a supervisor behaves like Ctrl-C: finish the current page, then stop
         raise KeyboardInterrupt
@@ -474,16 +652,18 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _term)
     try:
         return a.fn(a)
-    except SplunkError as e:
-        log.error("%s", e)
-        return 1
-    except httpx.HTTPError as e:  # connection refused, TLS failure, timeout: one line, not a traceback
-        hint = " (self-signed certificate? use --ca-bundle or, for a lab, --insecure)" if "CERTIFICATE_VERIFY_FAILED" in str(e) else ""
-        log.error("%s: %s%s", getattr(a, "url", "connection"), e or type(e).__name__, hint)
-        return 1
-    except Exception:  # noqa: BLE001 - record the traceback in run.log, not just on the terminal
-        log.exception("unexpected error")
-        return 1
+    except SystemExit:
+        raise
+    except BaseException as e:  # noqa: BLE001 - every failure ends with one ERROR line: what failed, and what to do
+        d = explain(e, a)
+        log.error("%s", d.message)
+        if d.hint:
+            log.error("   -> %s", d.hint)
+        if d.traceback:
+            log.error("traceback:", exc_info=e)
+        return d.code
+    finally:
+        teardown_logging()
 
 
 if __name__ == "__main__":

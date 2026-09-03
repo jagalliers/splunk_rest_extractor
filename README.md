@@ -93,7 +93,7 @@ syntax and the argument silently disappears.
 Stop a run with Ctrl-C and re-run the same command to resume. A run killed outright
 (closed window, `kill -9`, `taskkill`) resumes the same way: interrupted chunks are
 re-queued and leftover `.part` files are removed. One run per output directory: a
-second `run` on the same `--out` exits with "another splunk-extract run is active".
+second `run` on the same `--out` stops with "another splunk-extract run is active".
 
 **Do not put `earliest=`/`latest=` inside the SPL.** Inline modifiers override the
 REST parameters and would make every chunk search the same window; the tool
@@ -137,6 +137,29 @@ atomically on completion, so any file without `.part` is complete. Data files,
 * `--validate` levels: `job` (stored job evidence), `plan` (default: written ==
   planned), `total` (one extra `| stats count` over the whole range), `full`
   (re-read files, recount every chunk, `--sample N` re-extracts and diffs).
+
+## Errors and exit codes
+
+Every failure ends with an `ERROR` line saying what went wrong, followed by a
+`->` line saying what to do, in the same timestamped format as the rest of the
+log. `run.log` in the output directory holds the same text. A traceback appears
+only for a genuine bug, and then under a line that says so.
+
+```
+2026-09-03 12:30:27,486 INFO    MainThread limits: maxresultrows=50000 ...
+2026-09-03 12:30:27,490 ERROR   MainThread runs/last-day already holds a run for a different SPL
+2026-09-03 12:30:27,490 ERROR   MainThread    -> each run needs its own directory: pass a new --out, or re-run the original SPL to resume
+```
+
+| exit code | meaning |
+|---|---|
+| 0 | success (for `run`: every chunk done and validation passed) |
+| 1 | failure: cannot connect or authenticate, Splunk rejected a request, a chunk failed permanently, or validation failed |
+| 2 | usage: bad or missing argument, SPL the tool refuses, an unknown time zone, no credentials |
+| 130 | interrupted (Ctrl-C or SIGTERM); re-run the same command to resume |
+
+An interactive shell does not display the exit code. Read it right after the
+command with `$LASTEXITCODE` in PowerShell or `$?` in bash and zsh.
 
 ## Sizing for production
 

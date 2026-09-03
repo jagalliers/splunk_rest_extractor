@@ -201,6 +201,9 @@ with an explanation when they differ.
   and well under `srchJobsQuota`; the tool prints both when it can read them.
 * HTTP 503 / "quota" messages back off exponentially with jitter; 401 triggers a
   re-login; 5xx and timeouts retry the request; a 404 on a job restarts the chunk.
+  Transport errors before the first response of the session (wrong URL, port,
+  hostname, or certificate) are not retried: they never fix themselves, and the
+  CLI reports them at once with a hint.
 * Jobs are deleted as soon as their pages are on disk, and on any failure path,
   so dispatch disk does not accumulate.
 * Oldest chunks first by default (`--order`), so a multi-day run near a retention
