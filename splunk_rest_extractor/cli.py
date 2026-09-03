@@ -14,6 +14,9 @@ import time
 import uuid
 from pathlib import Path
 
+import httpx
+
+from . import envfile
 from . import spl as splmod
 from .client import SplunkClient, SplunkError
 from .executor import Executor, RunConfig, config_dict
@@ -36,17 +39,37 @@ def _env(*names: str) -> str | None:
 
 
 def add_conn_args(p: argparse.ArgumentParser) -> None:
-    g = p.add_argument_group("connection")
-    g.add_argument("--url", default=_env("SPLUNK_URL") or "https://127.0.0.1:8089", help="management URL (env SPLUNK_URL)")
-    g.add_argument("--token", default=_env("SPLUNK_TOKEN"), help="bearer token (env SPLUNK_TOKEN); preferred")
-    g.add_argument("--username", default=_env("SPLUNK_USERNAME", "SPLUNK_ADMIN_USER"), help="env SPLUNK_USERNAME")
-    g.add_argument("--password", default=_env("SPLUNK_PASSWORD", "SPLUNK_ADMIN_PASS"), help="env SPLUNK_PASSWORD")
-    g.add_argument("--ca-bundle", default=_env("SPLUNK_CA_BUNDLE"), help="CA bundle for TLS verification")
+    g = p.add_argument_group("connection", "flags win over the environment, which wins over the .env file")
+    g.add_argument("--url", help="management URL (env SPLUNK_URL; default https://127.0.0.1:8089)")
+    g.add_argument("--token", help="bearer token (env SPLUNK_TOKEN); preferred")
+    g.add_argument("--username", help="env SPLUNK_USERNAME")
+    g.add_argument("--password", help="env SPLUNK_PASSWORD")
+    g.add_argument("--ca-bundle", help="CA bundle for TLS verification (env SPLUNK_CA_BUNDLE)")
+    g.add_argument("--env-file", metavar="PATH", help="KEY=VALUE file to load first (default: .env in the current directory, if present)")
     g.add_argument("--insecure", action="store_true", help="disable TLS verification (lab only)")
     g.add_argument("--read-timeout", type=float, default=900.0)
 
 
+def resolve_connection(a: argparse.Namespace) -> None:
+    """Fill connection settings from the environment, after loading the .env file. Flags already set win."""
+    if a.env_file:
+        path = Path(a.env_file)
+        if not path.is_file():
+            raise SystemExit(f"--env-file {path}: no such file")
+    else:
+        path = Path(".env")
+    loaded = envfile.load(path)
+    if loaded:
+        log.info("loaded %s from %s", ", ".join(sorted(loaded)), path)
+    a.url = a.url or _env("SPLUNK_URL") or "https://127.0.0.1:8089"
+    a.token = a.token or _env("SPLUNK_TOKEN")
+    a.username = a.username or _env("SPLUNK_USERNAME", "SPLUNK_ADMIN_USER")
+    a.password = a.password or _env("SPLUNK_PASSWORD", "SPLUNK_ADMIN_PASS")
+    a.ca_bundle = a.ca_bundle or _env("SPLUNK_CA_BUNDLE")
+
+
 def make_client(a: argparse.Namespace) -> SplunkClient:
+    resolve_connection(a)
     verify: bool | str = True
     if a.insecure:
         verify = False
@@ -453,6 +476,10 @@ def main(argv: list[str] | None = None) -> int:
         return a.fn(a)
     except SplunkError as e:
         log.error("%s", e)
+        return 1
+    except httpx.HTTPError as e:  # connection refused, TLS failure, timeout: one line, not a traceback
+        hint = " (self-signed certificate? use --ca-bundle or, for a lab, --insecure)" if "CERTIFICATE_VERIFY_FAILED" in str(e) else ""
+        log.error("%s: %s%s", getattr(a, "url", "connection"), e or type(e).__name__, hint)
         return 1
     except Exception:  # noqa: BLE001 - record the traceback in run.log, not just on the terminal
         log.exception("unexpected error")

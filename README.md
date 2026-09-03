@@ -6,125 +6,62 @@ validation that nothing was dropped. Built for result sets far larger than a
 single search job can hold. Design, measured Splunk behaviours, and rationale are
 in [DESIGN.md](DESIGN.md).
 
-## Quick start (macOS)
+## Quick start
 
-```bash
-# 1. uv (Python project manager; installs Python 3.13 for you if needed)
-brew install uv
+Install Git and [uv](https://docs.astral.sh/uv/). uv downloads a Python if none is
+installed (3.11+ is required).
 
-# 2. get the code and its dependencies (uv installs a Python 3.11+ for you if needed)
+```
+macOS    brew install uv
+Windows  winget install --id Git.Git -e --source winget
+         winget install --id astral-sh.uv -e --source winget
+         (then open a new PowerShell: uv is only on the PATH of shells started after the install)
+```
+
+Everything below is the same in bash and PowerShell.
+
+```
 git clone https://github.com/jagalliers/splunk_rest_extractor.git
 cd splunk_rest_extractor
 uv sync
 
-# 3. credentials: copy the template and fill in SPLUNK_URL plus a token or user/password
-cp .env.example .env
-$EDITOR .env
-set -a && source .env && set +a       # export the variables for this shell
+cp .env.example .env                  # PowerShell: copy .env.example .env
+# edit .env: SPLUNK_URL plus a token or username/password. The tool reads it from the current directory.
 
-# 4. sanity check: how would a range be chunked?
-uv run splunk-extract plan --insecure --spl 'index=_internal' --earliest -1d@d --latest @d
+# sanity check: how would the range be chunked?
+uv run splunk-extract plan --insecure --spl 'index=_internal' --earliest -24h --latest now
 
-# 5. extract it
-uv run splunk-extract run --insecure --spl 'index=_internal' --earliest -1d@d --latest @d \
-    --out runs/internal-yesterday --validate total
+# extract it, with an independent count over the whole range at the end
+uv run splunk-extract run --insecure --spl 'index=_internal' --earliest -24h --latest now --out runs/last-day --validate total
 
-# 6. look at the result
-uv run splunk-extract status --out runs/internal-yesterday
-cat runs/internal-yesterday/report.md
-uv run splunk-extract head --out runs/internal-yesterday -n 3
+# look at the result
+uv run splunk-extract status --out runs/last-day
+uv run splunk-extract head --out runs/last-day -n 3
+cat runs/last-day/report.md           # PowerShell: type runs\last-day\report.md
+eport.md
 ```
 
 `--insecure` skips TLS verification for a self-signed lab certificate. Drop it and
-use `--ca-bundle /path/to/ca.pem` against a real search head.
+use `--ca-bundle /path/to/ca.pem` against a real search head. Cloning a private
+repository prompts for a GitHub sign-in (on Windows, Git Credential Manager opens a
+browser).
 
-To get a bearer token from Splunk (Settings → Tokens in the UI, or over REST):
+## Connection settings
 
-```bash
-curl -sk -u admin https://127.0.0.1:8089/services/authorization/tokens \
-  -d name=admin -d audience=splunk_rest_extractor \
-  -d expires_on="$(date -v+30d +%Y-%m-%dT%H:%M:%S%z)" -d output_mode=json | python3 -m json.tool
-```
+Each setting comes from its flag, else the environment, else `.env` in the current
+directory (`--env-file PATH` to read another file). Existing environment variables
+win over the file and blank values are ignored.
 
-## Quick start (Windows, PowerShell)
+| flag           | variable                                                      |
+|----------------|---------------------------------------------------------------|
+| `--url`        | `SPLUNK_URL` (default `https://127.0.0.1:8089`)               |
+| `--token`      | `SPLUNK_TOKEN` (preferred)                                    |
+| `--username`   | `SPLUNK_USERNAME` (or `SPLUNK_ADMIN_USER`)                    |
+| `--password`   | `SPLUNK_PASSWORD` (or `SPLUNK_ADMIN_PASS`)                    |
+| `--ca-bundle`  | `SPLUNK_CA_BUNDLE`                                            |
 
-Exercised end to end on Windows 11 (ARM64, Windows PowerShell 5.1, uv-managed
-Python 3.14) against a Splunk Enterprise 9.4.8 lab instance: `plan`, `run` in job
-and export mode, `validate --level full --sample`, `compact`, `head`, and the full
-integration suite. Overflow bisection down to the export fallback, resume after
-Ctrl-C and after a hard kill, and the per-directory run lock were exercised on
-Windows against a REST simulator of the same endpoints.
-
-```powershell
-# 1. prerequisites: Git and uv. `--source winget` skips the Microsoft Store source and its
-#    terms prompt; uv also pulls in the VC++ runtime it needs. Then close and reopen
-#    PowerShell: uv.exe lands in %LOCALAPPDATA%\Microsoft\WinGet\Links, which is only on
-#    the PATH of new shells.
-winget install --id Git.Git -e --source winget
-winget install --id astral-sh.uv -e --source winget
-
-# 2. get the code and its dependencies. On a private repo Git Credential Manager opens a
-#    browser sign-in. uv downloads a Python if none is installed (the newest 3.x; on an
-#    ARM64 machine it is the x86-64 build, which runs fine under emulation).
-git clone https://github.com/jagalliers/splunk_rest_extractor.git
-cd splunk_rest_extractor
-uv sync
-
-# 3. credentials: copy the template, fill in SPLUNK_URL plus a token or user/password,
-#    then load it into this PowerShell session (blank values are treated as unset)
-Copy-Item .env.example .env
-notepad .env
-Get-Content .env | ForEach-Object {
-  if ($_ -match '^\s*([^#][^=]*)=(.*)$') { Set-Item -Path "Env:$($matches[1].Trim())" -Value $matches[2].Trim() }
-}
-
-# 4. sanity check: how would a range be chunked?  Quote the relative times: an unquoted
-#    '@d' is splatting syntax to PowerShell and the argument silently disappears.
-uv run splunk-extract plan --insecure --spl 'index=_internal' --earliest '-1d@d' --latest '@d'
-
-# 5. extract it
-uv run splunk-extract run --insecure --spl 'index=_internal' --earliest '-1d@d' --latest '@d' `
-    --out runs\internal-yesterday --validate total
-
-# 6. look at the result. Windows PowerShell 5.1 reads files as ANSI unless told otherwise,
-#    so ask for UTF-8 or the report's dashes and check marks come out as mojibake.
-uv run splunk-extract status --out runs\internal-yesterday
-Get-Content runs\internal-yesterday\report.md -Encoding UTF8
-uv run splunk-extract head --out runs\internal-yesterday -n 3
-```
-
-Windows notes:
-
-* Progress and log lines go to stderr and to `run.log` in the output directory.
-  Windows PowerShell 5.1 renders redirected stderr (`2>&1`) as red
-  `NativeCommandError` records; that is PowerShell, not a failure. Read `run.log`.
-* `head` output and the printed report are UTF-8 even when redirected to a file or
-  piped, whatever the console code page. Read them back with
-  `Get-Content -Encoding UTF8`.
-* Non-UTC `--tz` values need the `tzdata` package (Windows has no system zoneinfo
-  database); the project depends on it on Windows, so `uv sync` brings it in.
-* Stop a run with Ctrl-C and re-run the same command to resume. A run killed
-  outright (closed window, `taskkill`) resumes the same way: interrupted chunks are
-  re-queued and leftover `.part` files are removed.
-* One run per output directory: a second `run` on the same `--out` exits with
-  "another splunk-extract run is active".
-
-To mint a bearer token from PowerShell (use `curl.exe`; plain `curl` is an alias
-for `Invoke-WebRequest` in Windows PowerShell 5):
-
-```powershell
-$exp = (Get-Date).AddDays(30).ToString('yyyy-MM-ddTHH:mm:sszz') + '00'
-curl.exe -sk -u admin https://127.0.0.1:8089/services/authorization/tokens `
-  -d name=admin -d audience=splunk_rest_extractor -d "expires_on=$exp" -d output_mode=json
-```
-
-## Install (any platform)
-
-```
-uv sync
-```
-
-Python 3.11+, one dependency (`httpx`).
+To get a bearer token, use Settings → Tokens in Splunk Web, or `POST
+/services/authorization/tokens` with `name`, `audience` and `expires_on`.
 
 ## Usage
 
@@ -151,6 +88,13 @@ splunk-extract compact --out runs/web-aug --delete-parts
 
 Time inputs accept epoch seconds, ISO-8601 (naive = UTC), or Splunk relative
 expressions such as `-30d@d`. The range is half-open: `earliest <= _time < latest`.
+In PowerShell, quote values that contain `@` (`'-30d@d'`): a bare `@d` is splatting
+syntax and the argument silently disappears.
+
+Stop a run with Ctrl-C and re-run the same command to resume. A run killed outright
+(closed window, `kill -9`, `taskkill`) resumes the same way: interrupted chunks are
+re-queued and leftover `.part` files are removed. One run per output directory: a
+second `run` on the same `--out` exits with "another splunk-extract run is active".
 
 **Do not put `earliest=`/`latest=` inside the SPL.** Inline modifiers override the
 REST parameters and would make every chunk search the same window; the tool
@@ -175,7 +119,8 @@ Each line is one event as JSON with, by default,
 `_time, _raw, index, sourcetype, source, host, _indextime, _bkt, _cd`
 (`--fields` to change, `--fields all` for everything Splunk returns,
 `--format raw` for bare `_raw` lines). Files are written to `.part` and renamed
-atomically on completion, so any file without `.part` is complete.
+atomically on completion, so any file without `.part` is complete. Data files,
+`run.log`, the report, and `head` output are UTF-8 on every platform.
 
 ## How completeness is ensured
 
@@ -213,5 +158,15 @@ atomically on completion, so any file without `.part` is complete.
 
 ```
 uv run pytest tests/unit                 # no Splunk needed
-uv run pytest tests/integration -v       # needs SPLUNK_* in the environment; pins the measured Splunk behaviours
+uv run pytest tests/integration -v       # needs SPLUNK_* (environment or .env); pins the measured Splunk behaviours
 ```
+
+## Platform notes
+
+* Exercised on macOS and on Windows 11 (ARM64, Windows PowerShell 5.1, uv-managed
+  Python 3.14) against Splunk Enterprise 9.4.8: every command, plus overflow
+  bisection down to the export fallback, resume after Ctrl-C and after a hard kill,
+  and the run lock against a REST simulator of the same endpoints.
+* Windows PowerShell 5.1 renders a native command's redirected stderr (`2>&1`) as
+  red `NativeCommandError` records. That is PowerShell, not a failure; progress and
+  log lines go to stderr and to `run.log` in the output directory.

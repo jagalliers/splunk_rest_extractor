@@ -229,14 +229,14 @@ def _same_content(client: SplunkClient, run: dict, opts: dict, c: Chunk, out_dir
 
 def _markdown(report: dict, run: dict, state: State) -> str:
     counts = state.counts()
-    lines = [f"# Extraction report — run {run['id']}", "",
+    lines = [f"# Extraction report - run {run['id']}", "",
              f"* SPL: `{run['spl']}`", f"* Range: [{run['earliest']}, {run['latest']}) epoch, pin index_latest={run['pin']}",
-             f"* Validation level: **{report['level']}** — overall **{'OK' if report['ok'] else 'FAILED'}**",
+             f"* Validation level: **{report['level']}** - overall **{'OK' if report['ok'] else 'FAILED'}**",
              f"* Rows written: {report.get('written_total', 0)}" + (f", independent total: {report['independent_total']}" if 'independent_total' in report else ""),
              "* Chunks: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())),
              f"* Invalid UTF-8 replacements: {report.get('utf8_replacements', 0)}", "", "## Checks", ""]
     for c in report["checks"]:
-        lines.append(f"* {'✅' if c['ok'] else '❌'} `{c['name']}` — {c['detail']}")
+        lines.append(f"* {'OK  ' if c['ok'] else 'FAIL'} `{c['name']}` - {c['detail']}")
     if report["chunks_with_issues"]:
         lines += ["", "## Chunks with issues", ""]
         for c in report["chunks_with_issues"]:
